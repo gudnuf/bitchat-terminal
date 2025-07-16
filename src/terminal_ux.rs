@@ -364,10 +364,12 @@ pub fn print_help() {
     println!("  \x1b[36m/channels\x1b[0m     List all discovered channels");
     println!("  \x1b[36m/online\x1b[0m       Show who's online");
     println!("  \x1b[36m/w\x1b[0m            Alias for /online");
-    println!("  \x1b[36m/peers\x1b[0m        Show peer encryption status\n");
+    println!("  \x1b[36m/peers\x1b[0m        Show peer encryption status");
+    println!("  \x1b[36m/peers\x1b[0m \x1b[90mencryption\x1b[0m Detailed encryption status\n");
     
     // Privacy & Security
     println!("\x1b[38;5;40m▶ Privacy & Security\x1b[0m");
+    println!("  \x1b[36m/encryption\x1b[0m   Detailed encryption status");
     println!("  \x1b[36m/block\x1b[0m \x1b[90m@user\x1b[0m  Block a user");
     println!("  \x1b[36m/block\x1b[0m        List blocked users");
     println!("  \x1b[36m/unblock\x1b[0m \x1b[90m@user\x1b[0m Unblock a user\n");

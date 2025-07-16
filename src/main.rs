@@ -71,6 +71,7 @@ macro_rules! debug_full_println {
 mod compression;
 mod fragmentation;
 mod encryption;
+mod noise_encryption;
 mod terminal_ux;
 mod persistence;
 mod cashu_wallet;
@@ -134,6 +135,7 @@ enum MessageType {
     DeliveryAck = 0x0A,          // Acknowledge message received
     DeliveryStatusRequest = 0x0B,  // Request delivery status
     ReadReceipt = 0x0C,          // Message has been read
+    NoiseHandshake = 0x0D,       // Noise Protocol handshake message
 }
 
 #[derive(Debug, Default, Clone)]
@@ -418,12 +420,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
 
+    debug_println!("[BLUETOOTH TX] Sending key exchange packet ({} bytes)", key_exchange_packet.len());
+    debug_full_println!("[BLUETOOTH TX] Key exchange raw data: {}", hex::encode(&key_exchange_packet));
     peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await?;
 
     // Add delay between key exchange and announce to ensure Android processes them properly
     time::sleep(Duration::from_millis(500)).await;
 
     let announce_packet = create_bitchat_packet(&my_peer_id, MessageType::Announce, nickname.as_bytes().to_vec());
+    debug_println!("[BLUETOOTH TX] Sending announce packet ({} bytes)", announce_packet.len());
+    debug_full_println!("[BLUETOOTH TX] Announce raw data: {}", hex::encode(&announce_packet));
 
     peripheral.write(cmd_char, &announce_packet, WriteType::WithoutResponse).await?;
 
@@ -432,6 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\x1b[90m» Using saved nickname: {}\x1b[0m", nickname);
     }
     println!("\x1b[90m» Type /status to see connection info\x1b[0m");
+    println!("\x1b[90m» This client supports Noise Protocol for enhanced security\x1b[0m");
 
 
     let peers: Arc<Mutex<HashMap<String, Peer>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -469,6 +476,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Note: We don't restore joined_channels as they need to be re-joined via announce
     
+    // Set up periodic cleanup timer for Noise sessions
+    let cleanup_interval = Duration::from_secs(300); // 5 minutes
+    let mut last_cleanup = std::time::Instant::now();
+    
     // Initialize Cashu wallet
     let cashu_wallet = match CashuWallet::new().await {
         Ok(wallet) => Some(wallet),
@@ -501,6 +512,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     loop {
+        // Periodic cleanup of expired Noise sessions
+        if last_cleanup.elapsed() > cleanup_interval {
+            debug_println!("Running periodic Noise session cleanup...");
+            encryption_service.cleanup_noise_sessions();
+            last_cleanup = std::time::Instant::now();
+        }
 
         tokio::select! {
 
@@ -1163,6 +1180,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 
+                // Handle /forcekey command
+                if line.starts_with("/forcekey") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() < 2 {
+                        println!("\x1b[93m⚠ Usage: /forcekey <nickname>\x1b[0m");
+                        println!("\x1b[90mForces a new key exchange with the specified user.\x1b[0m");
+                        continue;
+                    }
+                    
+                    let target_nickname = parts[1];
+                    
+                    // Try to find the peer ID for this nickname
+                    let mut found_peer_id = None;
+                    {
+                        let peers_lock = peers.lock().unwrap();
+                        for (peer_id, peer) in peers_lock.iter() {
+                            if let Some(ref nickname) = peer.nickname {
+                                if nickname == target_nickname {
+                                    found_peer_id = Some(peer_id.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(peer_id) = found_peer_id {
+                        // Generate new keys and send key exchange
+                        let (key_exchange_payload, _) = generate_keys_and_payload(&encryption_service);
+                        let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
+                        
+                        println!("\x1b[93m» Forcing key exchange with {} ({})\x1b[0m", target_nickname, peer_id);
+                        
+                        // Send the key exchange packet
+                        if let Err(e) = peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await {
+                            println!("\x1b[91m✗ Failed to send key exchange: {}\x1b[0m", e);
+                        } else {
+                            println!("\x1b[92m✓ Key exchange sent to {}\x1b[0m", target_nickname);
+                            debug_println!("[FORCEKEY] Sent key exchange to {} ({})", target_nickname, peer_id);
+                            debug_full_println!("[FORCEKEY] Key exchange packet: {}", hex::encode(&key_exchange_packet));
+                        }
+                    } else {
+                        println!("\x1b[93m⚠ User '{}' not found\x1b[0m", target_nickname);
+                        println!("\x1b[90mThey may be offline or haven't sent any messages yet.\x1b[0m");
+                    }
+                    continue;
+                }
+                
+                // Handle /keys command - show encryption status
+                if line == "/keys" {
+                    println!("\n\x1b[90mEncryption status:\x1b[0m");
+                    
+                    let peers_lock = peers.lock().unwrap();
+                    let encryption_status = encryption_service.get_encryption_status();
+                    
+                    if peers_lock.is_empty() {
+                        println!("\x1b[90mNo peers discovered yet.\x1b[0m");
+                    } else {
+                        for (peer_id, peer) in peers_lock.iter() {
+                            let has_key = encryption_service.has_peer_key(peer_id);
+                            let enc_info = encryption_status.iter()
+                                .find(|(id, _, _)| id == peer_id);
+                            
+                            let status_icon = if has_key { "✓" } else { "✗" };
+                            let status_color = if has_key { "\x1b[92m" } else { "\x1b[91m" };
+                            
+                            let nickname_display = peer.nickname.as_ref()
+                                .map(|n| n.as_str())
+                                .unwrap_or("<unknown>");
+                            
+                            println!("{}{} {} ({})\x1b[0m", 
+                                status_color, status_icon, nickname_display, peer_id);
+                            
+                            if let Some((_, enc_type, established)) = enc_info {
+                                println!("  \x1b[90mType: {:?}, Established: {}\x1b[0m", 
+                                    enc_type, established);
+                            }
+                            
+                            if let Some(fingerprint) = encryption_service.get_peer_fingerprint(peer_id) {
+                                println!("  \x1b[90mFingerprint: {}\x1b[0m", fingerprint);
+                            }
+                        }
+                    }
+                    
+                    println!("\n\x1b[90mUse /forcekey <nickname> to force a new key exchange.\x1b[0m");
+                    continue;
+                }
+                
                 // Handle /channels command
                 if line == "/channels" {
                     if discovered_channels.is_empty() {
@@ -1210,10 +1314,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let channel_count = chat_context.active_channels.len();
                     let dm_count = chat_context.active_dms.len();
                     
+                    // Get encryption statistics
+                    let encryption_status = encryption_service.get_encryption_status();
+                    let noise_count = encryption_status.iter()
+                        .filter(|(_, enc_type, _)| matches!(enc_type, crate::encryption::EncryptionType::Noise))
+                        .count();
+                    let legacy_count = encryption_status.iter()
+                        .filter(|(_, enc_type, _)| matches!(enc_type, crate::encryption::EncryptionType::Legacy))
+                        .count();
+                    
                     println!("\n╭─── Connection Status ───╮");
                     println!("│ Peers connected: {:3}    │", peer_count);
                     println!("│ Active channels: {:3}    │", channel_count);
                     println!("│ Active DMs:      {:3}    │", dm_count);
+                    println!("│                         │");
+                    println!("│ Encryption:             │");
+                    println!("│   Noise Protocol: {:2}    │", noise_count);
+                    println!("│   Legacy:         {:2}    │", legacy_count);
                     println!("│                         │");
                     println!("│ Your nickname: {:^9}│", if nickname.len() > 9 { &nickname[..9] } else { &nickname });
                     println!("│ Your ID: {}...│", &my_peer_id[..8]);
@@ -1223,21 +1340,117 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 
-                // Handle /peers command - show peer encryption status
-                if line == "/peers" {
-                    let peers_lock = peers.lock().unwrap();
-                    if peers_lock.is_empty() {
-                        println!("» No peers connected.");
+                // Handle /encryption command for detailed encryption status
+                if line == "/encryption" {
+                    let encryption_status = encryption_service.get_encryption_status();
+                    if encryption_status.is_empty() {
+                        println!("» No peers with encryption sessions.");
                     } else {
-                        println!("\n» Connected peers:");
-                        for (peer_id, peer) in peers_lock.iter() {
-                            let nickname = peer.nickname.as_deref().unwrap_or("<unnamed>");
-                            let has_keys = encryption_service.has_peer_key(peer_id);
-                            let key_status = if has_keys { "🔑" } else { "⚠️" };
-                            println!("  {} {} ({}...)", key_status, nickname, &peer_id[..8]);
+                        println!("\n\x1b[38;5;46m🔐 Encryption Status\x1b[0m");
+                        println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+                        
+                        let mut noise_peers = Vec::new();
+                        let mut legacy_peers = Vec::new();
+                        
+                        for (peer_id, enc_type, has_session) in encryption_status {
+                            let peers_lock = peers.lock().unwrap();
+                            let nickname = peers_lock.get(&peer_id)
+                                .and_then(|p| p.nickname.as_ref())
+                                .map_or(&peer_id, |n| n);
+                            
+                            let status_info = (nickname.to_string(), peer_id, has_session);
+                            
+                            match enc_type {
+                                crate::encryption::EncryptionType::Noise => noise_peers.push(status_info),
+                                crate::encryption::EncryptionType::Legacy => legacy_peers.push(status_info),
+                            }
                         }
-                        println!("\n🔑 = encryption keys exchanged, ⚠️ = no encryption keys");
-                        println!("» Use /dm <nickname> to send private messages to users with 🔑");
+                        
+                        if !noise_peers.is_empty() {
+                            println!("\n\x1b[38;5;208m🔥 Noise Protocol Framework\x1b[0m");
+                            for (nickname, peer_id, has_session) in noise_peers {
+                                let status = if has_session { "\x1b[92m✓ Ready\x1b[0m" } else { "\x1b[93m⚠ Handshaking\x1b[0m" };
+                                let peer_id_display = hex::encode(peer_id.as_bytes()).chars().take(8).collect::<String>();
+                                println!("  {} {} ({}...)", status, nickname, peer_id_display);
+                            }
+                        }
+                        
+                        if !legacy_peers.is_empty() {
+                            println!("\n\x1b[38;5;33m🔒 Legacy Encryption\x1b[0m");
+                            for (nickname, peer_id, has_session) in legacy_peers {
+                                let status = if has_session { "\x1b[92m✓ Ready\x1b[0m" } else { "\x1b[91m✗ No Keys\x1b[0m" };
+                                let peer_id_display = hex::encode(peer_id.as_bytes()).chars().take(8).collect::<String>();
+                                println!("  {} {} ({}...)", status, nickname, peer_id_display);
+                            }
+                        }
+                        
+                        println!("\n\x1b[90mNoise Protocol provides forward secrecy and enhanced security\x1b[0m");
+                        println!("\x1b[90mLegacy encryption is for backward compatibility\x1b[0m");
+                        println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
+                    }
+                    print!("> ");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
+                
+                // Handle /peers command - show peer encryption status
+                if line.starts_with("/peers") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    
+                    if parts.len() > 1 && parts[1] == "encryption" {
+                        // Show detailed encryption status
+                        let encryption_status = encryption_service.get_encryption_status();
+                        if encryption_status.is_empty() {
+                            println!("» No peers with encryption keys.");
+                        } else {
+                            println!("\n» Peer encryption status:");
+                            for (peer_id, enc_type, has_session) in encryption_status {
+                                let peers_lock = peers.lock().unwrap();
+                                let nickname = peers_lock.get(&peer_id)
+                                    .and_then(|p| p.nickname.as_ref())
+                                    .map_or(&peer_id, |n| n);
+                                
+                                let type_icon = match enc_type {
+                                    crate::encryption::EncryptionType::Noise => "🔥",
+                                    crate::encryption::EncryptionType::Legacy => "🔒",
+                                };
+                                let status_icon = if has_session { "✓" } else { "⚠️" };
+                                let peer_id_display = hex::encode(peer_id.as_bytes()).chars().take(8).collect::<String>();
+                                
+                                println!("  {} {} {} ({}...)", type_icon, status_icon, nickname, peer_id_display);
+                            }
+                            println!("\n🔥 = Noise Protocol, 🔒 = Legacy encryption");
+                            println!("✓ = session ready, ⚠️ = session not ready");
+                        }
+                    } else {
+                        // Standard peers command
+                        let peers_lock = peers.lock().unwrap();
+                        if peers_lock.is_empty() {
+                            println!("» No peers connected.");
+                        } else {
+                            println!("\n» Connected peers:");
+                            for (peer_id, peer) in peers_lock.iter() {
+                                let nickname = peer.nickname.as_deref().unwrap_or("<unnamed>");
+                                let has_keys = encryption_service.has_peer_key(peer_id);
+                                let key_status = if has_keys { "🔑" } else { "⚠️" };
+                                
+                                // Show encryption type if available
+                                let enc_type_info = if let Some(enc_type) = encryption_service.get_peer_encryption_type(peer_id) {
+                                    match enc_type {
+                                        crate::encryption::EncryptionType::Noise => " (Noise)",
+                                        crate::encryption::EncryptionType::Legacy => " (Legacy)",
+                                    }
+                                } else {
+                                    ""
+                                };
+                                let peer_id_display = hex::encode(peer_id.as_bytes()).chars().take(8).collect::<String>();
+                                
+                                println!("  {} {}{} ({}...)", key_status, nickname, enc_type_info, peer_id_display);
+                            }
+                            println!("\n🔑 = encryption keys exchanged, ⚠️ = no encryption keys");
+                            println!("» Use /dm <nickname> to send private messages to users with 🔑");
+                            println!("» Use /peers encryption for detailed encryption status");
+                        }
                     }
                     print!("> ");
                     std::io::stdout().flush().unwrap();
@@ -1669,6 +1882,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
 
             Some(notification) = notification_stream.next() => {
+                // Comprehensive Bluetooth logging
+                let raw_data = &notification.value;
+                debug_println!("[BLUETOOTH RX] Received notification ({} bytes)", raw_data.len());
+                debug_full_println!("[BLUETOOTH RX] Raw hex: {}", hex::encode(raw_data));
+                
                 // Simple packet logging
                 if notification.value.len() >= 2 {
                     let msg_type = notification.value[1];
@@ -2131,24 +2349,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                          MessageType::KeyExchange => {
                              // Extract public key
                              let public_key = packet.payload.clone();
-                             println!("[<-- RECV] Key exchange from {} (key: {} bytes)", packet.sender_id_str, public_key.len());
+                             debug_println!("[<-- RECV] Key exchange from {} (key: {} bytes)", packet.sender_id_str, public_key.len());
                              debug_full_println!("[CRYPTO] Key exchange payload first 32 bytes: {}", hex::encode(&public_key[..std::cmp::min(32, public_key.len())]));
                              
-                             // Add peer's public key to encryption service
+                             // Add peer's public key to encryption service and detect supported protocols
                              if let Err(e) = encryption_service.add_peer_public_key(&packet.sender_id_str, &public_key) {
                                  println!("[!] Failed to add peer public key: {:?}", e);
                              } else {
-                                 println!("[+] Successfully added encryption keys for peer {}", packet.sender_id_str);
+                                 debug_println!("[+] Successfully added encryption keys for peer {}", packet.sender_id_str);
                                  
-                                 // Always send our key exchange response (don't check if peer is in peers list)
-                                 // The peer might send KeyExchange before Announce
+                                 // Check if this peer supports Noise Protocol
+                                 if let Some(crate::encryption::EncryptionType::Noise) = encryption_service.get_peer_encryption_type(&packet.sender_id_str) {
+                                     debug_println!("[NOISE] Peer {} supports Noise Protocol, initiating handshake", packet.sender_id_str);
+                                     
+                                     // Try to initiate Noise handshake
+                                     match encryption_service.initiate_noise_handshake(&packet.sender_id_str) {
+                                         Ok(handshake_msg) => {
+                                             debug_println!("[NOISE] Sending Noise handshake to {}", packet.sender_id_str);
+                                             let noise_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseHandshake, handshake_msg);
+                                             if let Err(e) = peripheral.write(cmd_char, &noise_packet, WriteType::WithoutResponse).await {
+                                                 debug_println!("[NOISE] Failed to send Noise handshake: {}", e);
+                                             }
+                                         }
+                                         Err(e) => {
+                                             debug_println!("[NOISE] Failed to initiate Noise handshake: {:?}", e);
+                                         }
+                                     }
+                                 } else {
+                                     debug_println!("[LEGACY] Peer {} using legacy encryption", packet.sender_id_str);
+                                 }
+                                 
+                                 // Always send our key exchange response for backward compatibility
                                  debug_full_println!("[CRYPTO] Sending key exchange response to {}", packet.sender_id_str);
                                  let (key_exchange_payload, _) = generate_keys_and_payload(&encryption_service);
                                  let key_exchange_packet = create_bitchat_packet(&my_peer_id, MessageType::KeyExchange, key_exchange_payload);
                                  if let Err(e) = peripheral.write(cmd_char, &key_exchange_packet, WriteType::WithoutResponse).await {
-                                     println!("[!] Failed to send key exchange response: {}", e);
+                                     debug_println!("[!] Failed to send key exchange response: {}", e);
                                  } else {
-                                     println!("[+] Sent key exchange response to {}", packet.sender_id_str);
+                                     debug_println!("[+] Sent key exchange response to {}", packet.sender_id_str);
                                  }
                              }
                          },
@@ -2282,6 +2520,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         MessageType::ReadReceipt => {
                             // iOS defines this but doesn't implement it yet
                             debug_println!("[<-- RECV] Read receipt (not implemented)");
+                        },
+                        
+                        MessageType::NoiseHandshake => {
+                            debug_println!("[<-- RECV] Noise handshake from {}", packet.sender_id_str);
+                            
+                            // Process Noise handshake message
+                            match encryption_service.process_noise_handshake(&packet.sender_id_str, &packet.payload) {
+                                Ok(Some(response)) => {
+                                    debug_println!("[NOISE] Sending Noise handshake response to {}", packet.sender_id_str);
+                                    let response_packet = create_bitchat_packet(&my_peer_id, MessageType::NoiseHandshake, response);
+                                    if let Err(e) = peripheral.write(cmd_char, &response_packet, WriteType::WithoutResponse).await {
+                                        debug_println!("[NOISE] Failed to send handshake response: {}", e);
+                                    }
+                                }
+                                Ok(None) => {
+                                    debug_println!("[NOISE] Handshake processed, no response needed");
+                                }
+                                Err(e) => {
+                                    debug_println!("[NOISE] Failed to process handshake: {:?}", e);
+                                }
+                            }
                         },
                         
                         _ => {}
@@ -2637,6 +2896,7 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
         0x0A => MessageType::DeliveryAck,
         0x0B => MessageType::DeliveryStatusRequest,
         0x0C => MessageType::ReadReceipt,
+        0x0D => MessageType::NoiseHandshake,
         _ => return Err("Unknown message type."),
     };
 
@@ -2715,8 +2975,8 @@ fn parse_bitchat_packet(data: &[u8]) -> Result<BitchatPacket, &'static str> {
 }
 
 fn generate_keys_and_payload(encryption_service: &EncryptionService) -> (Vec<u8>, String) {
-    // Use the encryption service to get the combined public key data
-    let payload = encryption_service.get_combined_public_key_data();
+    // Use the legacy 96-byte format for compatibility with existing bitchat apps
+    let payload = encryption_service.get_legacy_public_key_data();
     
     // Generate fingerprint from identity key (last 32 bytes of the 96-byte payload)
     let identity_key_bytes = &payload[64..96];
@@ -3297,6 +3557,43 @@ async fn send_packet_with_fragmentation(
         
         Ok(())
     }
+}
+
+/// Helper function to write data to Bluetooth characteristic with debug logging
+async fn bluetooth_write_with_logging(
+    peripheral: &Peripheral,
+    cmd_char: &Characteristic,
+    data: &[u8],
+    write_type: WriteType,
+    context: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug_println!("[BLUETOOTH TX] {} - Sending {} bytes", context, data.len());
+    debug_full_println!("[BLUETOOTH TX] {} - Raw hex: {}", context, hex::encode(data));
+    
+    // Log packet type if this is a bitchat packet
+    if data.len() >= 2 {
+        let msg_type = data[1];
+        let msg_type_name = match msg_type {
+            0x01 => "Announce",
+            0x02 => "KeyExchange",
+            0x03 => "Leave",
+            0x04 => "Message",
+            0x05 => "FragmentStart",
+            0x06 => "FragmentContinue",
+            0x07 => "FragmentEnd",
+            0x08 => "ChannelAnnounce",
+            0x09 => "ChannelRetention",
+            0x0A => "DeliveryAck",
+            0x0B => "DeliveryStatusRequest",
+            0x0C => "ReadReceipt",
+            0x0D => "NoiseHandshake",
+            _ => "Unknown",
+        };
+        debug_println!("[BLUETOOTH TX] {} - Message type: {} (0x{:02X})", context, msg_type_name, msg_type);
+    }
+    
+    peripheral.write(cmd_char, data, write_type).await?;
+    Ok(())
 }
 
 async fn send_channel_announce(
