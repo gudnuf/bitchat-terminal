@@ -1,5 +1,55 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use chrono::{DateTime, Local};
+use cdk::nuts::Token;
+
+fn decode_cashu_token(token_str: &str) -> Option<String> {
+    // Remove the cashu: prefix if present
+    let token_without_prefix = if token_str.starts_with("cashu:") {
+        &token_str[6..]
+    } else {
+        token_str
+    };
+    
+    // Try to decode the token
+    match Token::from_str(token_without_prefix) {
+        Ok(token) => {
+            // Get token amount using the value() method which doesn't require keysets
+            let token_amount = match token.value() {
+                Ok(amount) => amount.to_string(),
+                Err(_) => "unknown".to_string(),
+            };
+            
+            // Get mint URL
+            let mint_url = match token.mint_url() {
+                Ok(url) => url.to_string(),
+                Err(_) => "unknown mint".to_string(),
+            };
+            
+            // Get token version info
+            let version = match &token {
+                Token::TokenV3(_) => "v3",
+                Token::TokenV4(_) => "v4",
+            };
+            
+            // Get memo if available
+            let memo_text = match token.memo() {
+                Some(memo) => format!(" ({})", memo),
+                None => String::new(),
+            };
+            
+            // Get unit
+            let unit = match token.unit() {
+                Some(unit) => format!("{:?}", unit).to_lowercase(),
+                None => "sat".to_string(),
+            };
+            
+            Some(format!("🎫 Cashu Token {}: {} {} from {}{}", 
+                version, token_amount, unit, mint_url, memo_text))
+        }
+        Err(_) => None, // Not a valid cashu token
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatMode {
@@ -8,7 +58,7 @@ pub enum ChatMode {
     PrivateDM { nickname: String, peer_id: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChatContext {
     pub current_mode: ChatMode,
     pub active_channels: Vec<String>,
@@ -223,41 +273,52 @@ pub fn format_message_display(
 ) -> String {
     let time_str = timestamp.format("%H:%M").to_string();
     
+    // Check if the content is a cashu token and decode it if so
+    let display_content = if content.starts_with("cashu:") || content.starts_with("cashu") {
+        if let Some(decoded) = decode_cashu_token(content) {
+            decoded
+        } else {
+            content.to_string()
+        }
+    } else {
+        content.to_string()
+    };
+    
     if is_private {
         // Use orange for private messages (matching iOS)
         if sender == my_nickname {
             // Message I sent - use brighter orange
             if let Some(recipient) = recipient {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, content)
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → {}>\x1b[0m {}", time_str, recipient, display_content)
             } else {
-                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, content)
+                format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;214m<you → ???>\x1b[0m {}", time_str, display_content)
             }
         } else {
             // Message I received - use normal orange
-            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, content)
+            format!("\x1b[2;38;5;208m[{}|DM]\x1b[0m \x1b[38;5;208m<{} → you>\x1b[0m {}", time_str, sender, display_content)
         }
     } else if is_channel {
         // Use blue for channel messages (matching iOS)
         if sender == my_nickname {
             // My messages - use light blue (256-color)
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[38;5;117m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[38;5;117m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
             }
         } else {
             // Other users - use normal blue
             if let Some(channel) = channel_name {
-                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, content)
+                format!("\x1b[2;34m[{}|{}]\x1b[0m \x1b[34m<{} @ {}>\x1b[0m {}", time_str, channel, sender, channel, display_content)
             } else {
-                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, content)
+                format!("\x1b[2;34m[{}|Ch]\x1b[0m \x1b[34m<{} @ ???>\x1b[0m {}", time_str, sender, display_content)
             }
         }
     } else {
         // Public message - use green for metadata
         if sender == my_nickname {
             // My messages - use light green (256-color)
-            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, content)
+            format!("\x1b[2;32m[{}]\x1b[0m \x1b[38;5;120m<{}>\x1b[0m {}", time_str, sender, display_content)
         } else {
             // Other users - use normal green
             format!("\x1b[2;32m[{}]\x1b[0m \x1b[32m<{}>\x1b[0m {}", time_str, sender, content)
@@ -302,13 +363,20 @@ pub fn print_help() {
     println!("\x1b[38;5;40m▶ Discovery\x1b[0m");
     println!("  \x1b[36m/channels\x1b[0m     List all discovered channels");
     println!("  \x1b[36m/online\x1b[0m       Show who's online");
-    println!("  \x1b[36m/w\x1b[0m            Alias for /online\n");
+    println!("  \x1b[36m/w\x1b[0m            Alias for /online");
+    println!("  \x1b[36m/peers\x1b[0m        Show peer encryption status\n");
     
     // Privacy & Security
     println!("\x1b[38;5;40m▶ Privacy & Security\x1b[0m");
     println!("  \x1b[36m/block\x1b[0m \x1b[90m@user\x1b[0m  Block a user");
     println!("  \x1b[36m/block\x1b[0m        List blocked users");
     println!("  \x1b[36m/unblock\x1b[0m \x1b[90m@user\x1b[0m Unblock a user\n");
+    
+    // Payments
+    println!("\x1b[38;5;40m▶ Payments\x1b[0m");
+    println!("  \x1b[36m/pay\x1b[0m \x1b[90m@user <amount>\x1b[0m Send Cashu payment via DM");
+    println!("  \x1b[36m/cashu_send\x1b[0m \x1b[90m<amount>\x1b[0m Send Cashu token to current chat");
+    println!("  \x1b[36m/cashu\x1b[0m \x1b[90m<command>\x1b[0m  Manage Cashu wallet\n");
     
     println!("\x1b[38;5;40m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m");
 }
@@ -339,4 +407,4 @@ impl ChatMode {
     pub fn is_private(&self) -> bool {
         matches!(self, ChatMode::PrivateDM { .. })
     }
-}
+} 
